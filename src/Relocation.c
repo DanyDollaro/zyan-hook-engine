@@ -29,63 +29,12 @@
 #include <Zycore/Types.h>
 #include <Zycore/Vector.h>
 #include <Zydis/Zydis.h>
+#include <Zyrex/Internal/Analysis.h>
 #include <Zyrex/Internal/Relocation.h>
 
 /* ============================================================================================== */
 /* Enums and types                                                                                */
 /* ============================================================================================== */
-
-/* ---------------------------------------------------------------------------------------------- */
-/* Analyzed instruction                                                                           */
-/* ---------------------------------------------------------------------------------------------- */
-
-/**
- * @brief   Defines the `ZyrexAnalyzedInstruction` struct.
- */
-typedef struct ZyrexAnalyzedInstruction_
-{
-    /**
-     * @brief   The address of the instruction relative to the start of the source buffer.
-     */
-    ZyanUSize address_offset;
-    /**
-     * @brief   The absolute runtime/memory address of the instruction.
-     */
-    ZyanUPointer address;
-    /**
-     * @brief   The `ZydisDecodedInstruction` struct of the analyzed instruction.
-     */
-    ZydisDecodedInstruction instruction;
-    /**
-     * @brief   Signals, if the instruction refers to a target address using a relative offset.
-     */
-    ZyanBool has_relative_target;
-    /**
-     * @brief   Signals, if the target address referred by the relative offset is not inside the
-     *          analyzed code chunk.
-     */
-    ZyanBool has_external_target;
-    /**
-     * @brief   Signals, if this instruction is targeted by at least one instruction from inside
-     *          the analyzed code chunk.
-     */
-    ZyanBool is_internal_target;
-    /**
-     * @brief   The absolute target address of the instruction calculated from the relative offset,
-     *          if applicable.
-     */
-    ZyanU64 absolute_target_address;
-    /**
-     * @brief   Contains the ids of all instructions inside the analyzed code chunk that are
-     *          targeting this instruction using a relative offset.
-     */
-    ZyanVector/*<ZyanU8>*/ incoming;
-    /**
-     * @brief   The id of an instruction inside the analyzed code chunk which is targeted by
-     *          this instruction using a relative offset, or `-1` if not applicable.
-     */
-    ZyanU8 outgoing;
-} ZyrexAnalyzedInstruction;
 
 /* ---------------------------------------------------------------------------------------------- */
 /* Relocation context                                                                             */
@@ -150,202 +99,8 @@ typedef struct ZyrexRelocationContext_
 /* ============================================================================================== */
 
 /* ---------------------------------------------------------------------------------------------- */
-/* ZyrexAnalyzedInstruction                                                                       */
+/* Relocation specific instruction analysis                                                       */
 /* ---------------------------------------------------------------------------------------------- */
-
-/**
- * @brief   Finalizes the given `ZyrexAnalyzedInstruction` struct.
- *
- * @param   item    A pointer to the `ZyrexAnalyzedInstruction` struct.
- */
-static void ZyrexAnalyzedInstructionDestroy(ZyrexAnalyzedInstruction* item)
-{
-    ZYAN_ASSERT(item);
-
-    if (item->is_internal_target)
-    {
-        ZyanVectorDestroy(&item->incoming);   
-    }
-}
-
-/* ---------------------------------------------------------------------------------------------- */
-/* Instruction analysis                                                                           */
-/* ---------------------------------------------------------------------------------------------- */
-
-/**
- * @brief   Analyzes the code in the source buffer and updates the relocation-context.
- *
- * @param   buffer              A pointer to the buffer that contains the code to analyze.
- * @param   length              The length of the buffer.
- * @param   bytes_to_analyze    The minimum number of bytes to analyze. More bytes might get
- *                              accessed on demand to keep individual instructions intact.
- * @param   instructions        Returns a new `ZyanVector` instance which contains all analyzed
- *                              instructions.
- *                              The vector needs to manually get destroyed by calling
- *                              `ZyanVectorDestroy` when no longer needed.
- * @param   bytes_read          Returns the exact amount of bytes read from the buffer.
- *
- * @return  A zyan status code.
- */
-static ZyanStatus ZyrexAnalyzeCode(const void* buffer, ZyanUSize length, 
-    ZyanUSize bytes_to_analyze, ZyanVector/*<ZyrexAnalyzedInstruction>*/* instructions,
-    ZyanUSize* bytes_read)
-{
-    ZYAN_ASSERT(buffer);
-    ZYAN_ASSERT(length);
-    ZYAN_ASSERT(bytes_to_analyze);
-
-    ZydisDecoder decoder;
-#if defined(ZYAN_X86)
-    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
-#elif defined(ZYAN_X64)
-    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
-#else
-#   error "Unsupported architecture detected"
-#endif
-
-    ZYAN_CHECK(ZyanVectorInit(instructions, sizeof(ZyrexAnalyzedInstruction), 
-        ZYREX_TRAMPOLINE_MAX_INSTRUCTION_COUNT, 
-        (ZyanMemberProcedure)&ZyrexAnalyzedInstructionDestroy));
-
-    // First pass:
-    //   - Determine exact amount of instructions and instruction bytes
-    //   - Decode all instructions and calculate relative target address for instructions with
-    //     relative offsets
-    //
-    ZyanUSize offset = 0;
-    while (offset < bytes_to_analyze)
-    {
-        ZyrexAnalyzedInstruction item;
-
-        ZYAN_CHECK(ZydisDecoderDecodeInstruction(&decoder, ZYAN_NULL, 
-            (const ZyanU8*)buffer + offset, length - offset, &item.instruction));
-
-        item.address_offset = offset;
-        item.address = (ZyanUPointer)(const ZyanU8*)buffer + offset;
-        item.has_relative_target = (item.instruction.attributes & ZYDIS_ATTRIB_IS_RELATIVE)
-            ? ZYAN_TRUE
-            : ZYAN_FALSE;
-        item.has_external_target = item.has_relative_target;
-        item.absolute_target_address = 0;
-        if (item.has_relative_target)
-        {
-            ZYAN_CHECK(ZyrexCalcAbsoluteAddress(&item.instruction, 
-                (ZyanU64)buffer + offset, &item.absolute_target_address));    
-        }
-        item.is_internal_target = ZYAN_FALSE;
-        item.outgoing = (ZyanU8)(-1);
-        ZYAN_CHECK(ZyanVectorPushBack(instructions, &item));
-
-        offset += item.instruction.length;
-    }
-
-    ZYAN_ASSERT(offset >= bytes_to_analyze);
-    *bytes_read = offset;
-
-    // Second pass:
-    //   - Find internal outgoing target for instructions with relative offsets
-    //   - Find internal incoming targets from instructions with relative offsets
-    //
-    for (ZyanUSize i = 0; i < instructions->size; ++i)
-    {
-        ZyrexAnalyzedInstruction* const current = ZyanVectorGetMutable(instructions, i);
-        ZYAN_ASSERT(current);
-
-        for (ZyanUSize j = 0; j < instructions->size; ++j)
-        {
-            ZyrexAnalyzedInstruction* const item = ZyanVectorGetMutable(instructions, j);
-            ZYAN_ASSERT(item);
-
-            if (item->has_relative_target && (item->absolute_target_address == current->address))
-            {
-                // The `item` instruction targets the `current` instruction
-                item->has_external_target = ZYAN_FALSE;
-                item->outgoing = (ZyanU8)i;
-
-                // The `current` instruction is an internal target of the `item` instruction
-                if (!current->is_internal_target)
-                {
-                    current->is_internal_target = ZYAN_TRUE;
-                    ZYAN_CHECK(ZyanVectorInit(&current->incoming, sizeof(ZyanU8), 2, 
-                        ZYAN_NULL));    
-                }
-                const ZyanU8 value = (ZyanU8)j;
-                ZYAN_CHECK(ZyanVectorPushBack(&current->incoming, &value));
-            }
-        }
-    }
-    
-    return ZYAN_STATUS_SUCCESS;
-}
-
-/**
- * @brief   Checks if the given instruction is a relative branch instruction.
- *
- * @param   instruction A pointer to the `ZydisDecodedInstruction` struct of the instruction to
- *                      check.
- *
- * @return  `ZYAN_TRUE` if the instruction is a supported relative branch instruction or
- *          `ZYAN_FALSE`, if not. 
- */
-static ZyanBool ZyrexIsRelativeBranchInstruction(const ZydisDecodedInstruction* instruction)
-{
-    ZYAN_ASSERT(instruction);
-
-    if (!instruction->raw.imm[0].is_relative)
-    {
-        return ZYAN_FALSE;
-    }
-
-    switch (instruction->mnemonic)
-    {
-    case ZYDIS_MNEMONIC_JMP:
-    case ZYDIS_MNEMONIC_JO:
-    case ZYDIS_MNEMONIC_JNO:
-    case ZYDIS_MNEMONIC_JB:
-    case ZYDIS_MNEMONIC_JNB:
-    case ZYDIS_MNEMONIC_JZ:
-    case ZYDIS_MNEMONIC_JNZ:
-    case ZYDIS_MNEMONIC_JBE:
-    case ZYDIS_MNEMONIC_JNBE:
-    case ZYDIS_MNEMONIC_JS:
-    case ZYDIS_MNEMONIC_JNS:
-    case ZYDIS_MNEMONIC_JP:
-    case ZYDIS_MNEMONIC_JNP:
-    case ZYDIS_MNEMONIC_JL:
-    case ZYDIS_MNEMONIC_JNL:
-    case ZYDIS_MNEMONIC_JLE:
-    case ZYDIS_MNEMONIC_JNLE:
-    case ZYDIS_MNEMONIC_JCXZ:
-    case ZYDIS_MNEMONIC_JECXZ:
-    case ZYDIS_MNEMONIC_JRCXZ:
-    case ZYDIS_MNEMONIC_LOOP:
-    case ZYDIS_MNEMONIC_LOOPE:
-    case ZYDIS_MNEMONIC_LOOPNE:
-        return ZYAN_TRUE;
-    default:
-        return ZYAN_FALSE;
-    }
-}
-
-/**
- * @brief   Checks if the given instruction is an instruction with a relative memory operand.
- *
- * @param   instruction A pointer to the `ZydisDecodedInstruction` struct of the instruction to
- *                      check.
- *
- * @return  `ZYAN_TRUE` if the instruction is an instruction with a relative memory operand or
- *          `ZYAN_FALSE`, if not.
- */
-static ZyanBool ZyrexIsRelativeMemoryInstruction(const ZydisDecodedInstruction* instruction)
-{
-    ZYAN_ASSERT(instruction);
-
-    return ((instruction->attributes & ZYDIS_ATTRIB_HAS_MODRM) &&
-        (instruction->raw.modrm.mod == 0) && (instruction->raw.modrm.rm == 5))
-        ? ZYAN_TRUE
-        : ZYAN_FALSE;
-}
 
 /**
  * @brief   Checks if the given relative branch instruction needs to be rewritten in order to
@@ -569,7 +324,7 @@ static ZyanStatus ZyrexRelocateRelativeBranchInstruction(ZyrexRelocationContext*
 
             // Generate `JMP` to `1` branch
             ZyrexWriteRelativeJump(address, (ZyanUPointer)instruction->absolute_target_address);
-            ZyrexUpdateRelocationContext(context, 2, (ZyanU8)context->bytes_read,
+            ZyrexUpdateRelocationContext(context, 5, (ZyanU8)context->bytes_read,
                 (ZyanU8)context->bytes_written + instruction->instruction.length + 2);
 
             return ZYAN_STATUS_SUCCESS;
@@ -718,19 +473,6 @@ static ZyanStatus ZyrexRelocateRelativeInstruction(ZyrexRelocationContext* conte
     ZYAN_ASSERT(context);
     ZYAN_ASSERT(instruction);
 
-    switch (instruction->instruction.mnemonic)
-    {
-    case ZYDIS_MNEMONIC_CALL:
-    {
-        // It's not safe to relocate a `CALL` instruction to the trampoline, as the code-flow
-        // will return to the trampoline at some time. If the hook has been removed in the
-        // meantime, the application will crash
-        return ZYAN_STATUS_FAILED; // TODO:
-    }
-    default:
-        break;
-    }
-
     // Relocate relative branch instruction
     if (ZyrexIsRelativeBranchInstruction(&instruction->instruction))
     {
@@ -858,6 +600,32 @@ static ZyanStatus ZyrexUpdateInstructionOffsets(ZyrexRelocationContext* context)
     return ZYAN_STATUS_SUCCESS;
 }
 
+/**
+ * @brief   Relocates a singele instruction and updates the relocation-context.
+ *
+ * @param   context     A pointer to the `ZyrexRelocationContext` struct.
+ * @param   instruction A pointer to the `ZyrexAnalyzedInstruction` struct of the instruction to
+ *                      relocate.
+ *
+ * @return  A zyan status code.
+ */
+static ZyanStatus ZyrexRelocateInstruction(ZyrexRelocationContext* context,
+    const ZyrexAnalyzedInstruction* const instruction)
+{
+    ZYAN_ASSERT(context);
+    ZYAN_ASSERT(instruction);
+
+    ZYAN_CHECK(instruction->has_relative_target
+        ? ZyrexRelocateRelativeInstruction(context, instruction)
+        : ZyrexRelocateCommonInstruction(context, instruction)
+    );
+
+    context->bytes_read += instruction->instruction.length;
+    ++context->instructions_read;
+
+    return ZYAN_STATUS_SUCCESS;
+}
+
 /* ---------------------------------------------------------------------------------------------- */
 
 /* ============================================================================================== */
@@ -888,8 +656,8 @@ ZyanStatus ZyrexRelocateCode(const void* source, ZyanUSize source_length,
     context.bytes_read           = 0;
     context.bytes_written        = 0;
 
-    ZYAN_CHECK(ZyrexAnalyzeCode(source, source_length, min_bytes_to_reloc, &context.instructions, 
-        &context.bytes_to_reloc));
+    ZYAN_CHECK(ZyrexAnalyzeInstructions(source, source_length, min_bytes_to_reloc,
+        &context.instructions, ZYREX_TRAMPOLINE_MAX_INSTRUCTION_COUNT, &context.bytes_to_reloc));
     ZYAN_ASSERT(context.instructions.data);
 
     // Relocate instructions
@@ -903,16 +671,7 @@ ZyanStatus ZyrexRelocateCode(const void* source, ZyanUSize source_length,
         const ZyrexAnalyzedInstruction* const item = ZyanVectorGet(&context.instructions, i);
         ZYAN_ASSERT(item);
 
-        if (item->has_relative_target)
-        {
-            ZYAN_CHECK(ZyrexRelocateRelativeInstruction(&context, item));    
-        } else
-        {
-            ZYAN_CHECK(ZyrexRelocateCommonInstruction(&context, item));
-        }
-
-        context.bytes_read += item->instruction.length;
-        ++context.instructions_read;
+        ZYAN_CHECK(ZyrexRelocateInstruction(&context, item));
     }
 
     ZYAN_ASSERT(context.bytes_read == context.bytes_to_reloc);
