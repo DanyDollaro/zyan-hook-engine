@@ -30,6 +30,7 @@
 #include <Zycore/API/Memory.h>
 #include <Zycore/API/Process.h>
 #include <Zydis/Zydis.h>
+#include <Zyrex/Internal/Analysis.h>
 #include <Zyrex/Internal/Relocation.h>
 #include <Zyrex/Internal/Trampoline.h>
 
@@ -670,6 +671,145 @@ static ZyanStatus ZyrexTrampolineRegionFree(ZyrexTrampolineRegion* region)
 }
 
 /* ---------------------------------------------------------------------------------------------- */
+/* Control transfer generation logic                                                              */
+/* ---------------------------------------------------------------------------------------------- */
+
+static void ZyrexRewriteCallAsPush(ZyrexTranslationContext* context,
+    const ZyrexAnalyzedInstruction* const instruction)
+{
+    ZYAN_ASSERT(context);
+    ZYAN_ASSERT(instruction);
+    ZYAN_ASSERT(instruction->instruction.mnemonic == ZYDIS_MNEMONIC_CALL);
+
+    ZyanU8* instruction_base = (ZyanU8* const)context->destination + context->bytes_written;
+
+    if (instruction->instruction.attributes & ZYDIS_ATTRIB_HAS_MODRM)
+    {
+        // Copy the instruction as is and mask out the second bit of the ModRM
+        ZYAN_MEMCPY(instruction_base, (const ZyanU8*)context->source + context->bytes_read,
+            instruction->instruction.length);
+        *(instruction_base + instruction->instruction.raw.modrm.offset) &= (ZyanU8)(~2);
+    } else
+    {
+        ZYAN_ASSERT(instruction->absolute_target_address);
+        ZyrexWritePushSizeType(instruction_base, instruction->absolute_target_address);
+        // TODO: fix for x86
+        context->bytes_written += 13;
+    }
+
+    context->instructions_written++;
+}
+
+static ZyanStatus ZyrexTrampolineRecursivelyMountRopChain(ZyrexTranslationContext* context,
+    const ZyrexAnalyzedInstruction* const instruction, ZyanUPointer* backjump_address)
+{
+    ZYAN_ASSERT(context);
+    ZYAN_ASSERT(instruction);
+    ZYAN_ASSERT(backjump_address);
+
+    ZYAN_UNUSED(context);
+    ZYAN_UNUSED(instruction);
+    ZYAN_UNUSED(backjump_address);
+
+    // TODO
+
+    return ZYAN_STATUS_FAILED;
+}
+
+/**
+ * @brief   Write the control transfer code used by the trampoline to jump to the callback.
+ *
+ * @param   chunk               A pointer to the `ZyrexTrampolineChunk` struct.
+ * @param   address             The address of the function to create the control transfer code for.
+ * @param   callback            The address of the callback function the code will redirect to.
+ * @param   min_bytes_to_reloc  Specifies the minimum amount of  bytes that need to be relocated
+ *                              to the trampoline (usually equals the size of the branch
+ *                              instruction used for hooking).
+ *                              This function might copy more bytes on demand to keep individual
+ *                              instructions intact.
+ * @param   max_bytes_to_read   The maximum amount of bytes that can be safely read from the given
+ *                              `address`.
+ * @param   bytes_read          The amount of bytes 
+ *
+ * @return  A zyan status code.
+ */
+static ZyanStatus ZyrexTrampolineChunkWriteControlTransferCode(ZyrexTrampolineChunk* chunk,
+    const void* address, ZyanUSize min_bytes_to_translate, ZyanUSize max_bytes_to_read,
+    ZyanU8* bytes_read)
+{
+    ZYAN_ASSERT(chunk);
+    ZYAN_ASSERT(address);
+    ZYAN_ASSERT(min_bytes_to_translate <= max_bytes_to_read);
+    ZYAN_ASSERT(bytes_read);
+
+    ZyrexTranslationContext context;
+    context.bytes_to_translate   = 0;
+    context.source               = address;
+    context.source_length        = max_bytes_to_read;
+    context.destination          = &chunk->code_buffer;
+    context.destination_length   = ZYREX_TRAMPOLINE_MAX_CODE_SIZE +
+                                   ZYREX_TRAMPOLINE_MAX_CODE_SIZE_BONUS;
+    context.translation_map      = &chunk->translation_map;
+    context.instructions_read    = 0;
+    context.instructions_written = 0;
+    context.bytes_read           = 0;
+    context.bytes_written        = 0;
+
+    ZYAN_CHECK(ZyrexAnalyzeInstructions(address, max_bytes_to_read, min_bytes_to_translate,
+        &context.instructions, ZYREX_TRAMPOLINE_MAX_INSTRUCTION_COUNT, &context.bytes_to_translate));
+    ZYAN_ASSERT(context.instructions.data);
+
+    // Translate instructions
+    for (ZyanUSize i = 0; i < context.instructions.size; i++)
+    {
+        // The code buffer is full
+        ZYAN_ASSERT(context.bytes_written < context.destination_length);
+        // The translation map is full
+        ZYAN_ASSERT(context.instructions_read < ZYAN_ARRAY_LENGTH(context.translation_map->items));
+
+        const ZyrexAnalyzedInstruction* const item = ZyanVectorGet(&context.instructions, i);
+        ZYAN_ASSERT(item);
+
+        if (item->instruction.mnemonic == ZYDIS_MNEMONIC_CALL)
+        {
+            // TODO: check
+            ZyrexTrampolineRecursivelyMountRopChain(&context, item, &chunk->backjump_address);
+            break;
+        }
+
+        ZYAN_CHECK(ZyrexRelocateInstruction(&context, item));
+    }
+
+    // Finalize the translation process
+    ZYAN_CHECK(ZyrexUpdateInstructionsOffsets(&context));
+
+    ZYAN_ASSERT(context.bytes_read == context.bytes_to_translate);
+    ZYAN_ASSERT(context.bytes_read <= ZYAN_ARRAY_LENGTH(chunk->original_code));
+    ZYAN_ASSERT(context.bytes_written <= ZYAN_ARRAY_LENGTH(chunk->code_buffer));
+    
+    // Write backjump
+    ZyrexWriteAbsoluteJump(&chunk->code_buffer[context.bytes_written],
+        (ZyanUPointer)&chunk->backjump_address);
+    chunk->code_buffer_size = (ZyanU8)context.bytes_written;
+    chunk->backjump_address = (ZyanUPointer)address + context.bytes_read;
+
+    // Fill remaining space with `INT 3` instructions
+    const ZyanUSize bytes_remaining = sizeof(chunk->code_buffer) - context.bytes_written;
+    if (bytes_remaining > 0)
+    {
+        ZYAN_MEMSET(&chunk->code_buffer[context.bytes_written + ZYREX_SIZEOF_ABSOLUTE_JUMP], 0xCC,
+            bytes_remaining - ZYREX_SIZEOF_ABSOLUTE_JUMP);
+    }
+
+    ZYAN_CHECK(ZyanProcessFlushInstructionCache(&chunk->code_buffer,
+        ZYREX_TRAMPOLINE_MAX_CODE_SIZE_WITH_BACKJUMP + ZYREX_TRAMPOLINE_MAX_CODE_SIZE_BONUS));
+
+    *bytes_read = (ZyanU8)context.bytes_read;
+
+    return ZYAN_STATUS_SUCCESS;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /* Trampoline chunk                                                                               */
 /* ---------------------------------------------------------------------------------------------- */
 
@@ -703,42 +843,19 @@ static ZyanStatus ZyrexTrampolineChunkInit(ZyrexTrampolineChunk* chunk, const vo
 
 #if defined(ZYAN_X64)
     
+    // Write the callback jump code
     ZyrexWriteAbsoluteJump(&chunk->callback_jump, (ZyanUPointer)&chunk->callback_address);
-    ZYAN_CHECK(ZyanProcessFlushInstructionCache(&chunk->callback_jump, 
+    ZYAN_CHECK(ZyanProcessFlushInstructionCache(&chunk->callback_jump,
         ZYREX_SIZEOF_ABSOLUTE_JUMP));
 
 #endif
 
-    ZyanUSize bytes_read;
-    ZyanUSize bytes_written;
+    // Write the control transfer code
+    ZYAN_CHECK(ZyrexTrampolineChunkWriteControlTransferCode(chunk, address, min_bytes_to_reloc,
+        max_bytes_to_read, &chunk->original_code_size));
 
-    // Relocate instructions
-    ZYAN_CHECK(ZyrexRelocateCode(address, max_bytes_to_read, chunk, min_bytes_to_reloc, 
-        &bytes_read, &bytes_written));
-
-    ZYAN_ASSERT(bytes_read <= ZYAN_ARRAY_LENGTH(chunk->original_code));
-    ZYAN_ASSERT(bytes_written <= ZYAN_ARRAY_LENGTH(chunk->code_buffer));
-
-    // Write backjump
-    ZyrexWriteAbsoluteJump(&chunk->code_buffer[bytes_written],
-        (ZyanUPointer)&chunk->backjump_address);
-    chunk->code_buffer_size = (ZyanU8)bytes_written;
-    chunk->backjump_address = (ZyanUPointer)address + bytes_read;
-
-    // Fill remaining space with `INT 3` instructions
-    const ZyanUSize bytes_remaining = sizeof(chunk->code_buffer) - bytes_written;
-    if (bytes_remaining > 0)
-    {
-        ZYAN_MEMSET(&chunk->code_buffer[bytes_written + ZYREX_SIZEOF_ABSOLUTE_JUMP], 0xCC,
-            bytes_remaining - ZYREX_SIZEOF_ABSOLUTE_JUMP);
-    }
-
-    ZYAN_CHECK(ZyanProcessFlushInstructionCache(&chunk->code_buffer, 
-        ZYREX_TRAMPOLINE_MAX_CODE_SIZE_WITH_BACKJUMP + ZYREX_TRAMPOLINE_MAX_CODE_SIZE_BONUS));
-
-    // Backup original instructions 
-    chunk->original_code_size = (ZyanU8)bytes_read;
-    ZYAN_MEMCPY(chunk->original_code, address, bytes_read);
+    // Backup original instructions
+    ZYAN_MEMCPY(chunk->original_code, address, chunk->original_code_size);
 
     return ZYAN_STATUS_SUCCESS;
 }
@@ -748,6 +865,26 @@ static ZyanStatus ZyrexTrampolineChunkInit(ZyrexTrampolineChunk* chunk, const vo
 /* ============================================================================================== */
 /* Public functions                                                                               */
 /* ============================================================================================== */
+
+/* ---------------------------------------------------------------------------------------------- */
+/* Translation map                                                                                */
+/* ---------------------------------------------------------------------------------------------- */
+
+void ZyrexUpdateTranslationContext(ZyrexTranslationContext* context, ZyanUSize length,
+    ZyanU8 offset_source, ZyanU8 offset_destination)
+{
+    ZYAN_ASSERT(context);
+    ZYAN_ASSERT(
+        context->translation_map->count < ZYAN_ARRAY_LENGTH(context->translation_map->items));
+
+    context->translation_map->items[context->translation_map->count].offset_source =
+        offset_source;
+    context->translation_map->items[context->translation_map->count].offset_destination =
+        offset_destination;
+    ++context->translation_map->count;
+    ++context->instructions_written;
+    context->bytes_written += length;
+}
 
 /* ---------------------------------------------------------------------------------------------- */
 /* Creation and destruction                                                                       */

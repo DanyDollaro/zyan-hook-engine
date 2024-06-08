@@ -43,24 +43,30 @@ extern "C" {
 /* ---------------------------------------------------------------------------------------------- */
 
 /**
- * @brief   Copies all instructions from the `source` address to the given `trampoline` chunk
- *          until at least `min_bytes_to_reloc` bytes has been moved.
+ * @brief   Updates the offsets of instructions with relative offsets pointing to instructions
+ *          inside the relocated code.
  *
- * @param   source              A pointer to the source buffer.
- * @param   source_length       The maximum amount of bytes that can be safely read from the 
- *                              source buffer.
- * @param   trampoline          A pointer to the destination trampoline chunk.
- * @param   min_bytes_to_reloc  Specifies the minimum amount of bytes that should be relocated.
- *                              This function might copy more bytes on demand to keep individual
- *                              instructions intact.
- * @param   bytes_read          Returns the number of bytes read from the source buffer.
- * @param   bytes_written       Returns the number of bytes written to the destination buffer.
+ * @param   context     A pointer to the `ZyrexRelocationContext` struct.
+ *
+ * @return  A zyan status code.
+ *
+ * As some of the instructions might have been enlarged or rewritten, there is a chance that the
+ * relative offset of previous instructions does not point to the correct target any longer. This
+ * function compensates all instruction shifts happened during the relocation process.
+ */
+ZyanStatus ZyrexUpdateInstructionsOffsets(ZyrexTranslationContext* context);
+
+/**
+ * @brief   Relocates a single instruction and updates the relocation-context.
+ *
+ * @param   context     A pointer to the `ZyrexRelocationContext` struct.
+ * @param   instruction A pointer to the `ZyrexAnalyzedInstruction` struct of the instruction to
+ *                      relocate.
  *
  * @return  A zyan status code.
  */
-ZyanStatus ZyrexRelocateCode(const void* source, ZyanUSize source_length, 
-    ZyrexTrampolineChunk* trampoline, ZyanUSize min_bytes_to_reloc, ZyanUSize* bytes_read, 
-    ZyanUSize* bytes_written);
+ZyanStatus ZyrexRelocateInstruction(ZyrexTranslationContext* context,
+    const ZyrexAnalyzedInstruction* const instruction);
 
 /* ---------------------------------------------------------------------------------------------- */
 

@@ -126,6 +126,26 @@ ZYAN_INLINE void ZyrexWriteAbsoluteJump(void* address, ZyanUPointer destination)
 }
 
 /* ---------------------------------------------------------------------------------------------- */
+/* Pushes                                                                                         */
+/* ---------------------------------------------------------------------------------------------- */
+
+ZYAN_INLINE void ZyrexWritePushSizeType(void* address, ZyanUSize value)
+{
+    ZyanU8* instr = (ZyanU8*)address;
+
+    *instr++ = 0x68;
+#if defined(ZYAN_X86)
+    * (ZyanI32*)(instr) = value;
+#else
+    * (ZyanU32*)(instr) = (ZyanU32)value;
+    instr += 4;
+    *(ZyanU32*)(instr) = 0x042444C7;
+    instr += 4;
+    *(ZyanU32*)(instr) = (ZyanU32)(value >> 32);
+#endif
+}
+
+/* ---------------------------------------------------------------------------------------------- */
 /* Instruction decoding                                                                           */
 /* ---------------------------------------------------------------------------------------------- */
 

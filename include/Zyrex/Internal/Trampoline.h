@@ -151,6 +151,58 @@ typedef struct ZyrexInstructionTranslationMap_
                                           ZYREX_TRAMPOLINE_MAX_INSTRUCTION_COUNT_BONUS];
 } ZyrexInstructionTranslationMap;
 
+/**
+ * @brief   Defines the `ZyrexTranslationContext` struct.
+ */
+typedef struct ZyrexTranslationContext_
+{
+    /**
+     * @brief   The exact amount of bytes that should be translated (relocated).
+     */
+    ZyanUSize bytes_to_translate;
+    /**
+     * @brief   Contains a `ZyrexAnalyzedInstruction` struct for each instruction in the source
+     *          buffer.
+     */
+    ZyanVector/*<ZyrexAnalyzedInstruction>*/ instructions;
+    /**
+     * @brief   A pointer to the source buffer.
+     */
+    const void* source;
+    /**
+     * @brief   The maximum amount of bytes that can be safely read from the source buffer.
+     */
+    ZyanUSize source_length;
+    /**
+     * @brief   A pointer to the destination buffer.
+     */
+    void* destination;
+    /**
+     * @brief   The maximum amount of bytes that can be safely written to the destination buffer.
+     */
+    ZyanUSize destination_length;
+    /**
+     * @brief   The instruction translation map.
+     */
+    ZyrexInstructionTranslationMap* translation_map;
+    /**
+     * @brief   The number of instructions read from the source buffer.
+     */
+    ZyanU8 instructions_read;
+    /**
+     * @brief   The number of instructions written to the destination buffer.
+     */
+    ZyanU8 instructions_written;
+    /**
+     * @brief   The number of bytes read from the source buffer.
+     */
+    ZyanUSize bytes_read;
+    /**
+     * @brief   The number of bytes written to the destination buffer.
+     */
+    ZyanUSize bytes_written;
+} ZyrexTranslationContext;
+
 /* ---------------------------------------------------------------------------------------------- */
 /* Trampoline chunk                                                                               */
 /* ---------------------------------------------------------------------------------------------- */
@@ -211,6 +263,24 @@ typedef struct ZyrexTrampolineChunk_
 /* ============================================================================================== */
 /* Functions                                                                                      */
 /* ============================================================================================== */
+
+/* ---------------------------------------------------------------------------------------------- */
+/* Translation map                                                                                */
+/* ---------------------------------------------------------------------------------------------- */
+
+/**
+ * @brief   Updates the given translation context.
+ *
+ * This function will add a new instruction with the given length and offsets to the translation-
+ * map and additionally updates the `instructions_written` and `bytes_written` fields.
+ *
+ * @param   context             A pointer to the `ZyrexTranslationContext` struct.
+ * @param   length              The length of the written instruction.
+ * @param   offset_source       The source offset of the instruction.
+ * @param   offset_destination  The destination offset of the instruction.
+ */
+void ZyrexUpdateTranslationContext(ZyrexTranslationContext* context, ZyanUSize length,
+    ZyanU8 offset_source, ZyanU8 offset_destination);
 
 /* ---------------------------------------------------------------------------------------------- */
 /* Creation and destruction                                                                       */
